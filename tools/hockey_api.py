@@ -25,7 +25,7 @@ def get_match_detail(match_id: int):
 def get_standings(league_id: int, season: int):
     params = {"leagueId": league_id, "season": season}
     r = requests.get(f"{BASE_URL}/standings", headers=HEADERS, params=params)
-    return r.json().get("data", [])
+    return r.json()
 
 def get_leagues(league_name: str = None, country_name: str = None):
     params = {}

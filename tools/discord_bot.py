@@ -3,15 +3,16 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import asyncio
 import threading
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timezone
 from hockey_config import (
     DISCORD_HOCKEY_BOT_TOKEN,
     DISCORD_GUILD_ID,
     DISCORD_CHANNEL_HOCKEY,
-    WORLD_CHAMPIONSHIP_LEAGUE_ID,
-    WORLD_CHAMPIONSHIP_SEASON,
 )
-from tools.hockey_api import get_standings, get_matches_by_date, get_standings_by_name
+from tools.hockey_api import (
+    get_standings, get_matches_by_date,
+    get_leagues, get_teams
+)
 from hockey_agents.hockey import (
     format_standings_table,
     format_score_line,
@@ -27,7 +28,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 _ready = threading.Event()
-_live_tracking = {}
+
+# {match_id: {"message": discord.Message, "score": "0:0", "goals": [], "state": ""}}
+_live_messages = {}
 
 
 @bot.event
@@ -44,32 +47,148 @@ async def on_ready():
     _ready.set()
 
 
+def build_live_embed(match: dict, goals: list) -> discord.Embed:
+    home = match["homeTeam"]["name"]
+    away = match["awayTeam"]["name"]
+    home_abbr = get_abbr(home)
+    away_abbr = get_abbr(away)
+    score = match["state"]["score"]["current"]
+    state_desc = match["state"]["description"]
+    clock = match["state"].get("clock") or ""
+
+    home_score = score["home"] if score else 0
+    away_score = score["away"] if score else 0
+
+    finished = state_desc in ("Finished", "Finished after penalties", "Finished after over time")
+
+    if finished:
+        title = f"✅ KONEC: [{home_abbr}] {home_score} : {away_score} [{away_abbr}]"
+        color = 0x5a5a6e
+    elif score:
+        title = f"🔴 LIVE: [{home_abbr}] {home_score} : {away_score} [{away_abbr}]"
+        color = 0xff4757
+    else:
+        title = f"⏳ [{home_abbr}] - : - [{away_abbr}]"
+        color = 0x7b5ea7
+
+    period_map = {
+        "1st period": "1. perioda",
+        "2nd period": "2. perioda",
+        "3rd period": "3. perioda",
+        "Over time": "Prodloužení",
+        "Break time": "Přestávka",
+        "Penalties": "Nájezdy",
+        "Finished": "Konec",
+        "Finished after penalties": "Konec po nájezdech",
+        "Finished after over time": "Konec po prodloužení",
+        "Not started": "Nezačalo",
+    }
+    period_str = period_map.get(state_desc, state_desc)
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(
+        name="🕐 Stav",
+        value=f"{period_str} {clock}".strip(),
+        inline=True,
+    )
+
+    s = match["state"]["score"]
+    thirds = []
+    if s.get("firstPeriod"):
+        thirds.append(f"1. třetina: {s['firstPeriod']['home']}:{s['firstPeriod']['away']}")
+    if s.get("secondPeriod"):
+        thirds.append(f"2. třetina: {s['secondPeriod']['home']}:{s['secondPeriod']['away']}")
+    if s.get("thirdPeriod"):
+        thirds.append(f"3. třetina: {s['thirdPeriod']['home']}:{s['thirdPeriod']['away']}")
+    if s.get("overTime"):
+        thirds.append(f"Prodloužení: {s['overTime']['home']}:{s['overTime']['away']}")
+    if s.get("penalties"):
+        thirds.append(f"Nájezdy: {s['penalties']['home']}:{s['penalties']['away']}")
+
+    if thirds:
+        embed.add_field(
+            name="📊 Po třetinách",
+            value="\n".join(thirds),
+            inline=True,
+        )
+
+    if goals:
+        goal_lines = []
+        for g in goals[-8:]:
+            goal_lines.append(f"🏒 {g['team_abbr']} — {g['time']} ({g['score']})")
+        embed.add_field(
+            name="⚡ Góly",
+            value="\n".join(goal_lines),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="⚡ Góly", value="Zatím žádný gól", inline=False)
+
+    embed.set_footer(text=f"Aktualizováno: {datetime.now().strftime('%H:%M:%S')}")
+    return embed
+
+
+def format_group_embed(group: dict, league_name: str, season: int) -> discord.Embed:
+    group_name = group.get("name", "Tabulka")
+    lines = ["`Tým              Z  V  P  VPP PPP  GF  GA  B`"]
+    for t in group.get("standings", []):
+        team = t.get("team", {})
+        pos = t.get("position", "-")
+        gp = t.get("gamesPlayed", 0)
+        w = t.get("wins", 0)
+        l = t.get("loses", 0)
+        wot = t.get("winsOvertime", 0)
+        lot = t.get("losesOvertime", 0)
+        gf = t.get("scoredGoals", 0)
+        ga = t.get("receivedGoals", 0)
+        pts = w * 3 + wot * 2 + lot * 1
+        name_short = team.get("name", "?")[:16].ljust(16)
+        lines.append(f"`{pos}. {name_short} {gp:2} {w:2} {l:2} {wot:2}  {lot:2}  {gf:3} {ga:3} {pts:3}`")
+
+    embed = discord.Embed(
+        title=f"🏒 {league_name} {season} — {group_name}",
+        description="\n".join(lines),
+        color=0x1D9E75,
+    )
+    embed.set_footer(text=f"Aktualizováno: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    return embed
+
+
 @bot.tree.command(
     name="htable",
     description="Zobrazí tabulku zadané ligy/turnaje",
     guild=discord.Object(id=DISCORD_GUILD_ID),
 )
-@app_commands.describe(liga="Název ligy nebo turnaje (např. World Championship, NHL, Extraliga)")
+@app_commands.describe(liga="Název ligy (např. World Championship, NHL, Tipsport Extraliga)")
 async def htable(interaction: discord.Interaction, liga: str):
     await interaction.response.defer(thinking=True)
     loop = asyncio.get_event_loop()
 
-    standings_data = await loop.run_in_executor(
-        None, lambda: get_standings_by_name(liga)
-    )
+    leagues = await loop.run_in_executor(None, lambda: get_leagues(liga))
+    if not leagues:
+        await interaction.followup.send(f"❌ Liga **{liga}** nenalezena.")
+        return
 
+    league = leagues[0]
+    league_id = league["id"]
+    seasons = league.get("seasons", [])
+    season = max(s["season"] for s in seasons) if seasons else 2026
+
+    standings_data = await loop.run_in_executor(
+        None, lambda: get_standings(league_id, season)
+    )
     if not standings_data:
         await interaction.followup.send(f"❌ Tabulka pro **{liga}** není dostupná.")
         return
 
-    table_text = format_standings_table(standings_data)
-    embed = discord.Embed(
-        title=f"🏒 {liga} — Tabulka",
-        description=table_text,
-        color=0x1D9E75,
-    )
-    embed.set_footer(text=f"Aktualizováno: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    await interaction.followup.send(embed=embed)
+    groups = standings_data.get("groups", [])
+    if not groups:
+        await interaction.followup.send(f"❌ Tabulka pro **{liga}** nemá skupiny.")
+        return
+
+    embeds = [format_group_embed(g, league["name"], season) for g in groups]
+    for i in range(0, len(embeds), 10):
+        await interaction.followup.send(embeds=embeds[i:i+10])
 
 
 @bot.tree.command(
@@ -103,18 +222,13 @@ async def hlive(interaction: discord.Interaction):
         await interaction.followup.send("📭 Dnes žádné zápasy oblíbených týmů.")
         return
 
-    embed = discord.Embed(title="🔴 LIVE — Oblíbené týmy", color=0xff4757)
+    embeds = []
     for m in matches:
-        state = m["state"]["description"]
-        score_line = format_score_line(m)
-        clock = m["state"].get("clock") or ""
-        embed.add_field(
-            name=score_line,
-            value=f"{state} {clock}",
-            inline=False,
-        )
-    embed.set_footer(text=f"Aktualizováno: {datetime.now().strftime('%H:%M:%S')}")
-    await interaction.followup.send(embed=embed)
+        match_id = m["id"]
+        goals = _live_messages.get(match_id, {}).get("goals", [])
+        embeds.append(build_live_embed(m, goals))
+
+    await interaction.followup.send(embeds=embeds[:4])
 
 
 @bot.tree.command(
@@ -230,47 +344,65 @@ async def live_score_loop():
 
     today = str(date.today())
     from hockey_config import FAVORITE_TEAMS
+
     for team in FAVORITE_TEAMS:
         matches = get_matches_by_date(today, team_name=team)
         for match in matches:
             state_desc = match["state"]["description"]
-            if state_desc in ("Not started", "Finished", "Finished after penalties",
-                              "Finished after over time", "Postponed", "Cancelled"):
-                continue
-
             match_id = match["id"]
             score = match["state"]["score"]["current"]
-            if not score:
+
+            if state_desc == "Not started":
                 continue
 
-            score_key = f"{score['home']}:{score['away']}"
-            prev_key = _live_tracking.get(match_id)
+            finished = state_desc in ("Finished", "Finished after penalties", "Finished after over time")
 
-            if prev_key != score_key:
-                _live_tracking[match_id] = score_key
-                if prev_key is not None:
-                    home = match["homeTeam"]["name"]
-                    away = match["awayTeam"]["name"]
-                    home_abbr = get_abbr(home)
-                    away_abbr = get_abbr(away)
-                    period = state_desc
-                    clock = match["state"].get("clock") or ""
+            if match_id not in _live_messages:
+                goals = []
+                embed = build_live_embed(match, goals)
+                msg = await channel.send(embed=embed)
+                _live_messages[match_id] = {
+                    "message": msg,
+                    "score": f"{score['home']}:{score['away']}" if score else "0:0",
+                    "goals": goals,
+                    "state": state_desc,
+                }
+                continue
 
-                    prev_home, prev_away = map(int, prev_key.split(":"))
+            tracked = _live_messages[match_id]
+            prev_score = tracked["score"]
+            goals = tracked["goals"]
+
+            if score:
+                current_score = f"{score['home']}:{score['away']}"
+                if current_score != prev_score:
+                    prev_home, prev_away = map(int, prev_score.split(":"))
                     new_home = score["home"]
                     new_away = score["away"]
+                    clock = match["state"].get("clock") or "?"
 
                     if new_home > prev_home:
-                        goal_team = f"**🚨 GÓÓÓL! {home}**"
+                        scorer_abbr = get_abbr(match["homeTeam"]["name"])
                     else:
-                        goal_team = f"**🚨 GÓÓÓL! {away}**"
+                        scorer_abbr = get_abbr(match["awayTeam"]["name"])
 
-                    msg = (
-                        f"{goal_team}\n"
-                        f"`[{home_abbr}] ({new_home}) : ({new_away}) [{away_abbr}]`\n"
-                        f"*{period} {clock}*"
-                    )
-                    await channel.send(msg)
+                    goals.append({
+                        "team_abbr": scorer_abbr,
+                        "time": clock,
+                        "score": current_score,
+                    })
+                    tracked["score"] = current_score
+
+            tracked["state"] = state_desc
+
+            try:
+                embed = build_live_embed(match, goals)
+                await tracked["message"].edit(embed=embed)
+            except Exception as e:
+                print(f"[HockeyBot] Edit error: {e}")
+
+            if finished:
+                del _live_messages[match_id]
 
 
 @tasks.loop(minutes=5)
@@ -282,6 +414,7 @@ async def pregame_check_loop():
     now = datetime.now(timezone.utc)
     today = str(date.today())
     from hockey_config import FAVORITE_TEAMS
+
     for team in FAVORITE_TEAMS:
         matches = get_matches_by_date(today, team_name=team)
         for match in matches:

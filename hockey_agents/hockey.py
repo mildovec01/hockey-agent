@@ -70,7 +70,7 @@ def format_standings_table(standings_data: dict) -> str:
     for group in groups:
         name = group.get("name", "Tabulka")
         lines.append(f"**{name}**")
-        lines.append("'Tým        Z     V     P     VPP     PPP     GF     GA     B")
+        lines.append("Tým                   Z               V               P               VPP                 PPP                 GF              GA              B")
         for t in group.get("standings", []):
             team = t.get("team", {})
             pos = t.get("position", "-")
