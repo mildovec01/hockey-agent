@@ -11,24 +11,22 @@ from hockey_config import (
     WORLD_CHAMPIONSHIP_LEAGUE_ID,
     WORLD_CHAMPIONSHIP_SEASON,
 )
-from tools.hockey_api import get_standings, get_matches_by_date
-from agentss.hockey import (
+from tools.hockey_api import get_standings, get_matches_by_date, get_standings_by_name
+from hockey_agents.hockey import (
     format_standings_table,
     format_score_line,
     get_favorite_matches_today,
-    get_upcoming_favorite_matches,
     generate_pregame_report,
     generate_tournament_prediction,
     WORLD_CHAMPIONSHIP_LEAGUE_ID as WC_ID,
     WORLD_CHAMPIONSHIP_SEASON as WC_SEASON,
+    get_abbr,
 )
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 _ready = threading.Event()
-
-# sledované live zápasy {match_id: last_score}
 _live_tracking = {}
 
 
@@ -46,8 +44,6 @@ async def on_ready():
     _ready.set()
 
 
-# ─── SLASH PŘÍKAZY ──────────────────────────────────────────
-
 @bot.tree.command(
     name="htable",
     description="Zobrazí tabulku zadané ligy/turnaje",
@@ -58,20 +54,8 @@ async def htable(interaction: discord.Interaction, liga: str):
     await interaction.response.defer(thinking=True)
     loop = asyncio.get_event_loop()
 
-    from tools.hockey_api import get_leagues
-    leagues = await loop.run_in_executor(None, lambda: get_leagues(liga))
-
-    if not leagues:
-        await interaction.followup.send(f"❌ Liga **{liga}** nenalezena.")
-        return
-
-    league = leagues[0]
-    league_id = league["id"]
-    seasons = league.get("seasons", [])
-    season = max(s["season"] for s in seasons) if seasons else 2026
-
     standings_data = await loop.run_in_executor(
-        None, lambda: get_standings(league_id, season)
+        None, lambda: get_standings_by_name(liga)
     )
 
     if not standings_data:
@@ -80,7 +64,7 @@ async def htable(interaction: discord.Interaction, liga: str):
 
     table_text = format_standings_table(standings_data)
     embed = discord.Embed(
-        title=f"🏒 {league['name']} {season} — Tabulka",
+        title=f"🏒 {liga} — Tabulka",
         description=table_text,
         color=0x1D9E75,
     )
@@ -90,7 +74,7 @@ async def htable(interaction: discord.Interaction, liga: str):
 
 @bot.tree.command(
     name="hteams",
-    description="Zobrazí nebo nastaví oblíbené týmy",
+    description="Zobrazí oblíbené týmy",
     guild=discord.Object(id=DISCORD_GUILD_ID),
 )
 async def hteams(interaction: discord.Interaction):
@@ -102,7 +86,7 @@ async def hteams(interaction: discord.Interaction):
         color=0x7b5ea7,
     )
     embed.set_footer(text="Pro změnu uprav FAVORITE_TEAMS v hockey_config.py")
-    await interaction.followup.send(embed=embed) if interaction.response.is_done() else await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -154,33 +138,13 @@ async def hpredict(interaction: discord.Interaction):
         description=prediction.get("analysis", ""),
         color=0xffd93d,
     )
-    embed.add_field(
-        name="🥇 Zlato",
-        value=prediction.get("gold_medal_prediction", "?"),
-        inline=True,
-    )
-    embed.add_field(
-        name="🥈 Stříbro",
-        value=prediction.get("silver_medal_prediction", "?"),
-        inline=True,
-    )
-    embed.add_field(
-        name="🥉 Bronz",
-        value=prediction.get("bronze_medal_prediction", "?"),
-        inline=True,
-    )
-    embed.add_field(
-        name="🃏 Dark horse",
-        value=prediction.get("dark_horse", "?"),
-        inline=True,
-    )
+    embed.add_field(name="🥇 Zlato", value=prediction.get("gold_medal_prediction", "?"), inline=True)
+    embed.add_field(name="🥈 Stříbro", value=prediction.get("silver_medal_prediction", "?"), inline=True)
+    embed.add_field(name="🥉 Bronz", value=prediction.get("bronze_medal_prediction", "?"), inline=True)
+    embed.add_field(name="🃏 Dark horse", value=prediction.get("dark_horse", "?"), inline=True)
     favorites = prediction.get("favorites", [])
     if favorites:
-        embed.add_field(
-            name="⭐ Favorité",
-            value=", ".join(favorites),
-            inline=False,
-        )
+        embed.add_field(name="⭐ Favorité", value=", ".join(favorites), inline=False)
     await interaction.followup.send(embed=embed)
 
 
@@ -207,7 +171,6 @@ async def hpregame(interaction: discord.Interaction, home: str, away: str):
          away.lower() in m["homeTeam"]["name"].lower()),
         None
     )
-
     if not match:
         match = {
             "homeTeam": {"name": home, "id": 0},
@@ -216,7 +179,6 @@ async def hpregame(interaction: discord.Interaction, home: str, away: str):
         }
 
     report = await loop.run_in_executor(None, lambda: generate_pregame_report(match))
-
     home_name = report.get("home_team", home)
     away_name = report.get("away_team", away)
     prob = report.get("win_probability", {})
@@ -228,23 +190,23 @@ async def hpregame(interaction: discord.Interaction, home: str, away: str):
     )
     embed.add_field(
         name=f"✅ {home_name} — silné stránky",
-        value="\n".join(f"• {s}" for s in report.get("home_strengths", [])),
+        value="\n".join(f"• {s}" for s in report.get("home_strengths", [])) or "—",
         inline=True,
     )
     embed.add_field(
         name=f"✅ {away_name} — silné stránky",
-        value="\n".join(f"• {s}" for s in report.get("away_strengths", [])),
+        value="\n".join(f"• {s}" for s in report.get("away_strengths", [])) or "—",
         inline=True,
     )
     embed.add_field(name="\u200b", value="\u200b", inline=False)
     embed.add_field(
         name=f"⚠️ {home_name} — slabé stránky",
-        value="\n".join(f"• {s}" for s in report.get("home_weaknesses", [])),
+        value="\n".join(f"• {s}" for s in report.get("home_weaknesses", [])) or "—",
         inline=True,
     )
     embed.add_field(
         name=f"⚠️ {away_name} — slabé stránky",
-        value="\n".join(f"• {s}" for s in report.get("away_weaknesses", [])),
+        value="\n".join(f"• {s}" for s in report.get("away_weaknesses", [])) or "—",
         inline=True,
     )
     embed.add_field(
@@ -260,17 +222,15 @@ async def hpregame(interaction: discord.Interaction, home: str, away: str):
     await interaction.followup.send(embed=embed)
 
 
-# ─── AUTOMATICKÉ ÚLOHY ──────────────────────────────────────
-
 @tasks.loop(minutes=1)
 async def live_score_loop():
-    """Každou minutu zkontroluje live zápasy oblíbených týmů a pošle góly"""
     channel = bot.get_channel(DISCORD_CHANNEL_HOCKEY)
     if not channel:
         return
 
     today = str(date.today())
-    for team in __import__('hockey_config').FAVORITE_TEAMS:
+    from hockey_config import FAVORITE_TEAMS
+    for team in FAVORITE_TEAMS:
         matches = get_matches_by_date(today, team_name=team)
         for match in matches:
             state_desc = match["state"]["description"]
@@ -291,8 +251,8 @@ async def live_score_loop():
                 if prev_key is not None:
                     home = match["homeTeam"]["name"]
                     away = match["awayTeam"]["name"]
-                    home_abbr = __import__('agents.hockey', fromlist=['get_abbr']).get_abbr(home)
-                    away_abbr = __import__('agents.hockey', fromlist=['get_abbr']).get_abbr(away)
+                    home_abbr = get_abbr(home)
+                    away_abbr = get_abbr(away)
                     period = state_desc
                     clock = match["state"].get("clock") or ""
 
@@ -315,15 +275,14 @@ async def live_score_loop():
 
 @tasks.loop(minutes=5)
 async def pregame_check_loop():
-    """Každých 5 minut zkontroluje jestli je zápas za 30 minut"""
     channel = bot.get_channel(DISCORD_CHANNEL_HOCKEY)
     if not channel:
         return
 
     now = datetime.now(timezone.utc)
     today = str(date.today())
-
-    for team in __import__('hockey_config').FAVORITE_TEAMS:
+    from hockey_config import FAVORITE_TEAMS
+    for team in FAVORITE_TEAMS:
         matches = get_matches_by_date(today, team_name=team)
         for match in matches:
             if match["state"]["description"] != "Not started":
@@ -359,12 +318,12 @@ async def send_pregame_embed(channel, report: dict, match: dict):
     )
     embed.add_field(
         name=f"✅ {home}",
-        value="\n".join(f"• {s}" for s in report.get("home_strengths", [])),
+        value="\n".join(f"• {s}" for s in report.get("home_strengths", [])) or "—",
         inline=True,
     )
     embed.add_field(
         name=f"✅ {away}",
-        value="\n".join(f"• {s}" for s in report.get("away_strengths", [])),
+        value="\n".join(f"• {s}" for s in report.get("away_strengths", [])) or "—",
         inline=True,
     )
     embed.add_field(

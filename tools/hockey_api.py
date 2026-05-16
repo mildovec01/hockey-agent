@@ -58,4 +58,27 @@ def get_head_to_head(team_id_1: int, team_id_2: int):
     r = requests.get(f"{BASE_URL}/head-2-head", headers=HEADERS, params=params)
     return r.json()
 
-            
+def get_standings_by_name(league_name: str) -> dict:
+    KNOWN_LEAGUES = {
+        "world championship": (95245, 2026),
+        "iihf": (95245, 2026),
+        "ms": (95245, 2026),
+        "mistrovstvi sveta": (95245, 2026),
+        "nhl": (49291, 2026),
+        "extraliga": (531, 2026),
+        "tipsport extraliga": (531, 2026),
+    }
+    
+    key = league_name.lower().strip()
+    for k, (lid, season) in KNOWN_LEAGUES.items():
+        if k in key or key in k:
+            return get_standings(lid, season)
+    
+    leagues = get_leagues(league_name)
+    if leagues:
+        l = leagues[0]
+        seasons = l.get("seasons", [])
+        season = max(s["season"] for s in seasons) if seasons else 2026
+        return get_standings(l["id"], season)
+    
+    return {}            
